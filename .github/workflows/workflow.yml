@@ -12,6 +12,8 @@ env:
   AWS_REGION: eu-central-1
   ECR_REPOSITORY: ecs-cicd-lab-dev-java-app
   IMAGE_TAG: latest
+  PROJECT_NAME: ecs-cicd-lab
+  ENVIRONMENT: dev
 
 jobs:
   build-and-push:
@@ -48,7 +50,7 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/ecs-cicd-lab-dev-github-actions-role
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/${{ env.PROJECT_NAME }}-${{ env.ENVIRONMENT }}-github-actions-role
           role-session-name: GitHubActionsSession
           aws-region: ${{ env.AWS_REGION }}
 
@@ -61,10 +63,13 @@ jobs:
       - name: Build Docker image
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          COMMIT_HASH: ${{ github.sha }}
         run: |
           echo "Building Docker image..."
+          
+          # Build with both latest and commit hash tags
           docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }} .
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:${COMMIT_HASH:0:7} .
           
           echo "Docker images built successfully:"
           docker images | grep $ECR_REPOSITORY
@@ -78,40 +83,53 @@ jobs:
           output: 'trivy-results.sarif'
         continue-on-error: true
 
-      # Step 9: Push Docker images to ECR
+      # Step 9: Upload Trivy scan results to GitHub Security tab
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+        continue-on-error: true
+
+      # Step 10: Push Docker images to ECR
       - name: Push Docker images to ECR
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          COMMIT_HASH: ${{ github.sha }}
         run: |
           echo "Pushing Docker images to ECR..."
+          
+          # Push both tags
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:${COMMIT_HASH:0:7}
           
           echo "Images pushed successfully:"
           echo "Latest: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
-          echo "SHA: $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}"
+          echo "SHA: $ECR_REGISTRY/$ECR_REPOSITORY:${COMMIT_HASH:0:7}"
 
-      # Step 10: Output image details
+      # Step 11: Output image details
       - name: Output image details
+        id: image-details
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          COMMIT_HASH: ${{ github.sha }}
         run: |
           echo "::notice::Docker image pushed to ECR"
           echo "::notice::Image URI: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
-          echo "::notice::Image SHA: $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}"
+          echo "::notice::Image SHA: $ECR_REGISTRY/$ECR_REPOSITORY:${COMMIT_HASH:0:7}"
           
-          # Create image details file for potential use in subsequent jobs
-          echo "IMAGE_URI=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
-          echo "IMAGE_SHA_URI=$ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}" >> $GITHUB_OUTPUT
+          # Set outputs for potential use in subsequent jobs
+          echo "image-uri=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "image-sha-uri=$ECR_REGISTRY/$ECR_REPOSITORY:${COMMIT_HASH:0:7}" >> $GITHUB_OUTPUT
 
-      # Step 11: Clean up local Docker images to save space
+      # Step 12: Clean up local Docker images to save space
       - name: Clean up
         if: always()
         run: |
           docker system prune -f
           docker image prune -af
 
-  # Optional: Deploy job (if you want to trigger deployment from GitHub)
+  # Deploy job - Triggers CodePipeline after successful build
   deploy:
     name: Trigger Deployment
     runs-on: ubuntu-latest
@@ -126,15 +144,51 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/ecs-cicd-lab-dev-github-actions-role
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/${{ env.PROJECT_NAME }}-${{ env.ENVIRONMENT }}-github-actions-role
           role-session-name: GitHubActionsDeploySession
           aws-region: ${{ env.AWS_REGION }}
 
-      # Optional: Manually trigger CodePipeline (EventBridge will do this automatically)
+      # Trigger CodePipeline manually (EventBridge should also trigger it automatically)
       - name: Trigger CodePipeline
         run: |
-          echo "Image pushed to ECR. EventBridge will automatically trigger CodePipeline."
-          echo "Pipeline: ecs-cicd-lab-dev-pipeline"
+          PIPELINE_NAME="${{ env.PROJECT_NAME }}-${{ env.ENVIRONMENT }}-pipeline"
           
-          # Optional: You can manually start the pipeline here if needed
-          # aws codepipeline start-pipeline-execution --name ecs-cicd-lab-dev-pipeline
+          echo "Triggering CodePipeline: $PIPELINE_NAME"
+          
+          # Start pipeline execution
+          EXECUTION_ID=$(aws codepipeline start-pipeline-execution \
+            --name $PIPELINE_NAME \
+            --query 'pipelineExecutionId' \
+            --output text)
+          
+          echo "Pipeline execution started with ID: $EXECUTION_ID"
+          echo "::notice::CodePipeline execution started: $EXECUTION_ID"
+          
+          # Optional: Wait for pipeline to start and get initial status
+          sleep 10
+          aws codepipeline get-pipeline-execution \
+            --pipeline-name $PIPELINE_NAME \
+            --pipeline-execution-id $EXECUTION_ID \
+            --query 'pipelineExecution.status' \
+            --output text
+
+      # Optional: Post deployment status to PR (if this was triggered by PR)
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { ECR_REGISTRY } = process.env;
+            const imageUri = `${ECR_REGISTRY}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `🚀 **Docker Image Built Successfully**
+            
+              **Image URI:** \`${imageUri}\`
+              **Commit:** ${context.sha.substring(0, 7)}
+            
+              The image has been pushed to ECR and is ready for deployment.`
+            });
